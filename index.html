@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<title>Rack Watcher — PWA</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<meta name="theme-color" content="#0b1020"/>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+:root{--ok:#10b981;--warn:#f59e0b;--bad:#ef4444;--bg:#0b1020;--fg:#e5e7eb;--mut:#94a3b8;--card:#0f172a;--border:#1f2937}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif}
+.wrap{max-width:1200px;margin:env(safe-area-inset-top) auto env(safe-area-inset-bottom);padding:16px}
+h1{font-size:20px;margin:0 0 12px}
+.grid{display:grid;grid-template-columns:1.2fr .8fr;gap:16px}
+@media(max-width:980px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+button{background:#1f2937;color:var(--fg);border:1px solid #374151;border-radius:12px;padding:10px 14px;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+input[type="range"],input[type="text"]{background:#0b1220;border:1px solid #334155;color:var(--fg);border-radius:10px;padding:8px 10px}
+input[type="range"]{width:150px}
+canvas{width:100%;border-radius:12px;background:#0b1220;touch-action:none}
+.pill{font-size:12px;color:var(--mut);padding:4px 8px;border:1px dashed #334155;border-radius:999px}
+.status{font-weight:700;padding:8px 12px;border-radius:999px;display:inline-flex;align-items:center;gap:8px}
+.ok{background:rgba(16,185,129,.15);color:var(--ok);border:1px solid rgba(16,185,129,.35)}
+.warn{background:rgba(245,158,11,.15);color:var(--warn);border:1px solid rgba(245,158,11,.35)}
+.bad{background:rgba(239,68,68,.15);color:var(--bad);border:1px solid rgba(239,68,68,.35)}
+.small{font-size:12px;color:var(--mut)}
+.list{display:flex;flex-direction:column;gap:8px;max-height:320px;overflow:auto}
+.item{display:flex;align-items:center;justify-content:space-between;gap:8px;border:1px solid #243245;background:#0c1325;border-radius:12px;padding:8px 10px}
+.item .name{font-weight:600}
+.hl-ok{color:var(--ok)} .hl-warn{color:var(--warn)} .hl-bad{color:var(--bad)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Rack Watcher — multi-zona (SSIM + Template) · PWA</h1>
+  <div class="grid">
+    <div class="card">
+      <div class="row">
+        <span id="cvStatus" class="pill">Cargando OpenCV…</span>
+        <span id="runStatus" class="status ok" style="display:none">Procesando</span>
+        <span id="alertStatus" class="status bad" style="display:none">¡ALERTA!</span>
+      </div>
+      <div class="row">
+        <button id="btnStart" disabled>Empezar cámara</button>
+        <button id="btnSwitch" disabled>🔄 Cambiar cámara</button>
+        <button id="btnStop" disabled>Detener</button>
+        <label class="small"><input type="checkbox" id="chkBeep" checked> Beep</label>
+        <label class="small"><input type="checkbox" id="chkDebug" checked> Debug</label>
+      </div>
+      <div class="row">
+        <label>SSIM OK: <span id="ssimVal">0.70</span></label><input id="ssim" type="range" min="0.50" max="0.90" step="0.01" value="0.70">
+        <label>NCC OK: <span id="nccVal">0.65</span></label><input id="ncc" type="range" min="0.50" max="0.90" step="0.01" value="0.65">
+        <label>Tolerancia: <span id="posVal">70</span> px</label><input id="pos" type="range" min="30" max="160" step="5" value="70">
+      </div>
+      <video id="video" playsinline webkit-playsinline muted style="display:none"></video>
+      <canvas id="live" width="960" height="540"></canvas>
+      <p class="small">Consejo: móvil fijo, buena luz. Puedes iniciar la cámara aunque no hayas guardado zonas aún.</p>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <input id="refFile" type="file" accept="image/*;capture=camera">
+        <button id="btnDraw" disabled>✏️ Dibujar zona</button>
+        <input id="zoneName" type="text" placeholder="Nombre (p.ej. 10 kg izq)" disabled>
+        <button id="btnSaveZone" disabled>➕ Guardar zona</button>
+        <button id="btnClearSel" disabled>Limpiar selección</button>
+        <button id="btnClearAll" disabled>🗑️ Borrar todas</button>
+      </div>
+      <canvas id="ref" width="640" height="360"></canvas>
+      <div class="row">
+        <span class="pill">Zonas: <span id="zoneCount">0</span></span>
+        <span class="pill">FPS: <span id="fpsInfo">—</span></span>
+      </div>
+      <div id="zoneList" class="list"></div>
+    </div>
+  </div>
+</div>
+
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+<script>
+let cvReady=false, running=false, timer=null, lastAlert=false, fps={t0:performance.now(),n:0};
+let currentStream=null, currentFacing='environment', devicesCache={user:null,environment:null};
+const zones=[]; // {id,name,roiRef:{x,y,w,h}, templateMat, state:'OK'|'OFFSITE'|'ABSENT', hist:[]}
+const bc = 'BroadcastChannel' in window ? new BroadcastChannel('rack-events') : null;
+
+// DOM elements
+const cvStatus=document.getElementById('cvStatus'), runStatus=document.getElementById('runStatus'), alertStatus=document.getElementById('alertStatus');
+const btnStart=document.getElementById('btnStart'), btnSwitch=document.getElementById('btnSwitch'), btnStop=document.getElementById('btnStop');
+const chkBeep=document.getElementById('chkBeep'), chkDebug=document.getElementById('chkDebug');
+const ssim=document.getElementById('ssim'), ssimVal=document.getElementById('ssimVal');
+const ncc=document.getElementById('ncc'), nccVal=document.getElementById('nccVal');
+const pos=document.getElementById('pos'), posVal=document.getElementById('posVal');
+[ssim,ncc,pos].forEach(inp=>inp.addEventListener('input',()=>{ ssimVal.textContent=Number(ssim.value).toFixed(2); nccVal.textContent=Number(ncc.value).toFixed(2); posVal.textContent=pos.value; }));
+const refFile=document.getElementById('refFile'), btnDraw=document.getElementById('btnDraw'), zoneName=document.getElementById('zoneName'), btnSaveZone=document.getElementById('btnSaveZone'), btnClearSel=document.getElementById('btnClearSel'), btnClearAll=document.getElementById('btnClearAll');
+const zoneCount=document.getElementById('zoneCount'), zoneList=document.getElementById('zoneList');
+const ref=document.getElementById('ref'), ctxRef=ref.getContext('2d');
+const live=document.getElementById('live'), ctxLive=live.getContext('2d');
+const video=document.getElementById('video');
+
+// Reference drawing
+let refImg=null, refDraw=null, drawing=false, roi=null, dragStart=null;
+function drawRefBase(){ ctxRef.clearRect(0,0,ref.width,ref.height); if(refImg&&refDraw){ ctxRef.drawImage(refImg,refDraw.x,refDraw.y,refDraw.w,refDraw.h);} }
+function updateOverlay(){ drawRefBase(); zones.forEach(z=>{ ctxRef.save(); ctxRef.strokeStyle='rgba(59,130,246,.8)'; ctxRef.setLineDash([5,4]); ctxRef.lineWidth=1.5; ctxRef.strokeRect(z.roiRef.x,z.roiRef.y,z.roiRef.w,z.roiRef.h); ctxRef.restore(); }); if(roi){ ctxRef.save(); ctxRef.strokeStyle='rgba(16,185,129,.9)'; ctxRef.setLineDash([6,4]); ctxRef.lineWidth=2; ctxRef.strokeRect(roi.x,roi.y,roi.w,roi.h); ctxRef.restore(); } }
+function getPos(ev,canvas){ const r=canvas.getBoundingClientRect(); const sx=canvas.width/r.width, sy=canvas.height/r.height; const t=ev.touches&&ev.touches[0]; const cx=t?t.clientX:ev.clientX, cy=t?t.clientY:ev.clientY; return {x:(cx-r.left)*sx, y:(cy-r.top)*sy}; }
+function beep(){ if(!chkBeep.checked) return; try{ const ac=new (window.AudioContext||window.webkitAudioContext)(); const o=ac.createOscillator(), g=ac.createGain(); o.connect(g); g.connect(ac.destination); o.type='square'; o.frequency.value=880; g.gain.value=0.06; o.start(); setTimeout(()=>{o.stop(); ac.close();},160);}catch(e){} }
+
+refFile.addEventListener('change',(e)=>{ const f=e.target.files?.[0]; if(!f) return; const img=new Image(); img.onload=()=>{ const s=Math.min(ref.width/img.width, ref.height/img.height); const w=img.width*s, h=img.height*s, x=(ref.width-w)/2, y=(ref.height-h)/2; refImg=img; refDraw={x,y,w,h}; drawRefBase(); [btnDraw, zoneName, btnClearSel, btnClearAll].forEach(el=>el.disabled=false); clearAllZones(); }; img.src=URL.createObjectURL(f); });
+ref.addEventListener('pointerdown',ev=>{ if(!drawing) return; ref.setPointerCapture(ev.pointerId); dragStart=getPos(ev,ref); });
+ref.addEventListener('pointermove',ev=>{ if(!drawing||!dragStart) return; const p=getPos(ev,ref); const x=Math.min(dragStart.x,p.x), y=Math.min(dragStart.y,p.y), w=Math.abs(p.x-dragStart.x), h=Math.abs(p.y-dragStart.y); roi={x,y,w,h}; updateOverlay(); btnSaveZone.disabled=!(zoneName.value.trim() && roi && roi.w>12 && roi.h>12 && !drawing); });
+btnDraw.addEventListener('click',()=>{ drawing=!drawing; btnDraw.textContent=drawing?'✅ Terminar dibujo':'✏️ Dibujar zona'; btnSaveZone.disabled=!(zoneName.value.trim() && roi && roi.w>12 && roi.h>12 && !drawing); });
+btnClearSel.addEventListener('click',()=>{ roi=null; dragStart=null; updateOverlay(); btnSaveZone.disabled=true; });
+zoneName.addEventListener('input',()=>{ btnSaveZone.disabled=!(zoneName.value.trim() && roi && roi.w>12 && roi.h>12 && !drawing); });
+
+btnSaveZone.addEventListener('click',()=>{
+  if(!roi || roi.w<12 || roi.h<12 || !zoneName.value.trim()){ alert('Dibuja una zona válida y pon un nombre.'); return; }
+  drawRefBase();
+  const src=cv.imread(ref);
+  const rect=new cv.Rect(Math.round(roi.x),Math.round(roi.y),Math.round(roi.w),Math.round(roi.h));
+  let tpl=src.roi(rect);
+  cv.cvtColor(tpl, tpl, cv.COLOR_RGBA2GRAY); cv.GaussianBlur(tpl, tpl, new cv.Size(3,3), 0);
+  zones.push({ id:Date.now()+Math.random(), name:zoneName.value.trim(), roiRef:{...roi}, templateMat:tpl, state:'—', hist:[] });
+  zoneName.value=''; roi=null; updateOverlay(); renderZoneList(); src.delete();
+  btnClearAll.disabled = zones.length===0;
+});
+
+function clearAllZones(){ zones.forEach(z=>{ try{ z.templateMat?.delete(); }catch{} }); zones.length=0; renderZoneList(); updateOverlay(); btnClearAll.disabled=true; }
+btnClearAll.addEventListener('click', clearAllZones);
+
+function renderZoneList(){ zoneCount.textContent=String(zones.length); zoneList.innerHTML=''; zones.forEach(z=>{ const div=document.createElement('div'); div.className='item'; const left=document.createElement('div'); left.innerHTML=`<div class="name">${z.name}</div><div class="small">${Math.round(z.roiRef.w)}×${Math.round(z.roiRef.h)} px</div>`; const right=document.createElement('div'); right.id='state-'+z.id; right.textContent='—'; div.append(left,right); zoneList.appendChild(div); }); }
+
+// SSIM
+function mssim(A,B){ const C1=6.5025, C2=58.5225; let I1=new cv.Mat(), I2=new cv.Mat(); A.convertTo(I1, cv.CV_32F); B.convertTo(I2, cv.CV_32F); let mu1=new cv.Mat(), mu2=new cv.Mat(); cv.GaussianBlur(I1,mu1,new cv.Size(11,11),1.5); cv.GaussianBlur(I2,mu2,new cv.Size(11,11),1.5); let mu1_2=new cv.Mat(), mu2_2=new cv.Mat(), mu1_mu2=new cv.Mat(); cv.multiply(mu1,mu1,mu1_2); cv.multiply(mu2,mu2,mu2_2); cv.multiply(mu1,mu2,mu1_mu2); let sigma1_2=new cv.Mat(), sigma2_2=new cv.Mat(), sigma12=new cv.Mat(); let I1_2=I1.mul(I1), I2_2=I2.mul(I2), I1_I2=I1.mul(I2); cv.GaussianBlur(I1_2,sigma1_2,new cv.Size(11,11),1.5); cv.subtract(sigma1_2,mu1_2,sigma1_2); cv.GaussianBlur(I2_2,sigma2_2,new cv.Size(11,11),1.5); cv.subtract(sigma2_2,mu2_2,sigma2_2); cv.GaussianBlur(I1_I2,sigma12,new cv.Size(11,11),1.5); cv.subtract(sigma12,mu1_mu2,sigma12); let t1=new cv.Mat(), t2=new cv.Mat(), t3=new cv.Mat(), ssim_map=new cv.Mat(); cv.addWeighted(mu1_mu2,2,new cv.Mat(mu1_mu2.rows,mu1_mu2.cols,mu1_mu2.type(),new cv.Scalar(C1)),1,0,t1); cv.addWeighted(sigma12,2,new cv.Mat(sigma12.rows,sigma12.cols,sigma12.type(),new cv.Scalar(C2)),1,0,t2); cv.multiply(t1,t2,t3); let t1b=new cv.Mat(), t2b=new cv.Mat(), t3b=new cv.Mat(); cv.add(mu1_2,mu2_2,t1b); cv.add(t1b,new cv.Mat(t1b.rows,t1b.cols,t1b.type(),new cv.Scalar(C1)),t1b); cv.add(sigma1_2,sigma2_2,t2b); cv.add(t2b,new cv.Mat(t2b.rows,t2b.cols,t2b.type(),new cv.Scalar(C2)),t2b); cv.multiply(t1b,t2b,t3b); cv.divide(t3,t3b,ssim_map); const mean=cv.mean(ssim_map)[0]/255; [I1,I2,mu1,mu2,mu1_2,mu2_2,mu1_mu2,sigma1_2,sigma2_2,sigma12,I1_2,I2_2,I1_I2,t1,t2,t3,t1b,t2b,t3b,ssim_map].forEach(m=>m.delete()); return mean; }
+
+// Camera
+async function stopStream(){ if(currentStream){ currentStream.getTracks().forEach(t=>t.stop()); } currentStream=null; }
+async function listCams(){ try{ const ds=await navigator.mediaDevices.enumerateDevices(); ds.filter(d=>d.kind==='videoinput').forEach(d=>{ const L=(d.label||'').toLowerCase(); if(L.includes('back')||L.includes('rear')) devicesCache.environment=d.deviceId; if(L.includes('front')) devicesCache.user=d.deviceId; }); }catch(e){} }
+async function startCam(prefer='environment'){ await stopStream(); let cons={video:{facingMode:prefer}, audio:false}; if(devicesCache[prefer]) cons.video={deviceId:{exact:devicesCache[prefer]}}; try{ const s=await navigator.mediaDevices.getUserMedia(cons); currentStream=s; video.srcObject=s; await video.play(); await listCams(); btnSwitch.disabled=false; return true; } catch(e){ try{ const s=await navigator.mediaDevices.getUserMedia({video:true,audio:false}); currentStream=s; video.srcObject=s; await video.play(); await listCams(); btnSwitch.disabled=false; return true; } catch(err){ alert('No se pudo acceder a la cámara. iOS: Ajustes → Safari → Cámara → Permitir.'); return false; } } }
+btnStart.addEventListener('click', async ()=>{ if(!cvReady){ alert('OpenCV aún está cargando.'); return; } btnStart.disabled=true; if(await startCam(currentFacing)){ btnStop.disabled=false; runStatus.style.display='inline-flex'; startLoop(); } else { btnStart.disabled=false; } });
+btnSwitch.addEventListener('click', async ()=>{ currentFacing=(currentFacing==='environment')?'user':'environment'; await startCam(currentFacing); });
+btnStop.addEventListener('click', async ()=>{ stopLoop(); await stopStream(); video.srcObject=null; btnStop.disabled=true; btnStart.disabled=false; runStatus.style.display='none'; alertStatus.style.display='none'; });
+
+function startLoop(){ running=true; if(timer) clearInterval(timer); timer=setInterval(processFrame,180); }
+function stopLoop(){ running=false; if(timer){ clearInterval(timer); timer=null; } }
+
+function setZoneState(z, state, extra=''){ const el=document.getElementById('state-'+z.id); z.hist.push(state); if(z.hist.length>3) z.hist.shift(); const stable=z.hist.length>=2 && z.hist[z.hist.length-1]===z.hist[z.hist.length-2]; if(!stable) return; z.state=state; if(!el) return; if(state==='OK'){ el.className='hl-ok'; el.textContent='✅ OK'; } else if(state==='OFFSITE'){ el.className='hl-warn'; el.textContent='🟠 Fuera'+(extra?` (${extra})`:''); } else if(state==='ABSENT'){ el.className='hl-bad'; el.textContent='❌ Ausente'; } else { el.className=''; el.textContent='—'; } const payload={ type:'zone_state', zone:{ id:z.id, name:z.name }, state, extra, ts:Date.now() }; try{ localStorage.setItem('lastEvent', JSON.stringify(payload)); }catch(e){} if(bc) bc.postMessage(payload); }
+
+function processFrame(){ if(!running) return; const W=live.width, H=live.height; ctxLive.drawImage(video,0,0,W,H); if(zones.length===0) return; let frame=cv.imread(live); let frameGray=new cv.Mat(); cv.cvtColor(frame,frameGray,cv.COLOR_RGBA2GRAY); cv.GaussianBlur(frameGray,frameGray,new cv.Size(3,3),0); let anyAlert=false; zones.forEach(z=>{ const r=new cv.Rect(Math.round(z.roiRef.x),Math.round(z.roiRef.y),Math.round(z.roiRef.w),Math.round(z.roiRef.h)); if(r.x<0||r.y<0||r.x+r.width>frameGray.cols||r.y+r.height>frameGray.rows){ setZoneState(z,'ABSENT'); anyAlert=true; return; } let livePatch=frameGray.roi(r); const s=mssim(z.templateMat, livePatch); if(s >= Number(ssim.value)){ if(chkDebug.checked){ ctxLive.save(); ctxLive.strokeStyle='rgba(16,185,129,.9)'; ctxLive.lineWidth=2; ctxLive.setLineDash([]); ctxLive.strokeRect(r.x,r.y,r.width,r.height); ctxLive.restore(); } setZoneState(z,'OK'); } else { const res=new cv.Mat(frameGray.rows - z.templateMat.rows + 1, frameGray.cols - z.templateMat.cols + 1, cv.CV_32FC1); cv.matchTemplate(frameGray, z.templateMat, res, cv.TM_CCOEFF_NORMED); const mm=cv.minMaxLoc(res); const best=mm.maxLoc; const score=mm.maxVal; const exp={ x: z.roiRef.x + z.roiRef.w/2, y: z.roiRef.y + z.roiRef.h/2 }; const found={ x: best.x + z.templateMat.cols/2, y: best.y + z.templateMat.rows/2 }; const d=Math.hypot(found.x-exp.x, found.y-exp.y); if(chkDebug.checked){ ctxLive.save(); ctxLive.strokeStyle='rgba(59,130,246,.9)'; ctxLive.setLineDash([6,4]); ctxLive.lineWidth=2; ctxLive.strokeRect(z.roiRef.x,z.roiRef.y,z.roiRef.w,z.roiRef.h); ctxLive.restore(); ctxLive.save(); ctxLive.strokeStyle='rgba(245,158,11,.9)'; ctxLive.setLineDash([]); ctxLive.lineWidth=2; ctxLive.strokeRect(best.x,best.y,z.templateMat.cols,z.templateMat.rows); ctxLive.restore(); } if(score >= Number(ncc.value)){ if(d > Number(pos.value)){ setZoneState(z,'OFFSITE', `${Math.round(d)}px`); anyAlert=true; } else { setZoneState(z,'OK'); } } else { setZoneState(z,'ABSENT'); anyAlert=true; } res.delete(); } livePatch.delete(); }); alertStatus.style.display = anyAlert ? 'inline-flex' : 'none'; if(anyAlert && !lastAlert) beep(); lastAlert=anyAlert; fps.n++; const t1=performance.now(); if(t1-fps.t0>=1000){ document.getElementById('fpsInfo').textContent=fps.n+' fps'; fps.n=0; fps.t0=t1; } frame.delete(); frameGray.delete(); }
+
+window.Module = { onRuntimeInitialized(){ cvReady=true; cvStatus.textContent='OpenCV listo'; btnStart.disabled=false; } };
+if('serviceWorker' in navigator){ window.addEventListener('load', ()=>{ navigator.serviceWorker.register('./sw.js').catch(()=>{}); }); }
+</script>
+</body>
+</html>
